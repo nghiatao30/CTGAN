@@ -1,10 +1,11 @@
 """CTGAN module."""
 
 import warnings
-
+import os
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
 from torch import optim
 from torch.nn import BatchNorm1d, Dropout, LeakyReLU, Linear, Module, ReLU, Sequential, functional
 from tqdm import tqdm
@@ -12,6 +13,7 @@ from tqdm import tqdm
 from ctgan.data_sampler import DataSampler
 from ctgan.data_transformer import DataTransformer
 from ctgan.synthesizers.base import BaseSynthesizer, random_state
+from torch.utils.data import DataLoader, TensorDataset
 
 
 class Discriminator(Module):
@@ -54,12 +56,25 @@ class Discriminator(Module):
 
         return gradient_penalty
 
+    def predict_with_logits(self, input_):
+        """Returns both preds and logits directly from the final layer in self.seq."""
+        # Kiểm tra nếu input_ là một TensorDataset, chuyển đổi sang Tensor
+        if isinstance(input_, TensorDataset):
+            # Lấy phần dữ liệu từ TensorDataset
+            input_ = input_.tensors[0]
+        # Đảm bảo input_ là một tensor và có đúng định dạng
+        if not isinstance(input_, torch.Tensor):
+            input_ = torch.tensor(input_, dtype=torch.float32)
+        input_ = input_.to(self.seq[0].weight.device)
+        logits = self.seq(input_)  # Sử dụng trực tiếp đầu ra từ self.seq
+        preds = torch.sigmoid(logits)  # Áp dụng hàm sigmoid để sinh ra xác suất
+        return preds, logits
+    
     def forward(self, input_):
         """Apply the Discriminator to the `input_`."""
         assert input_.size()[0] % self.pac == 0
-        return self.seq(input_.view(-1, self.pacdim))
-
-
+        return self.seq(input_.view(-1, self.pacdim))  # Truyền x qua chuỗi các lớp
+    
 class Residual(Module):
     """Residual layer for the CTGAN."""
 
@@ -152,11 +167,11 @@ class CTGAN(BaseSynthesizer):
         generator_decay=1e-6,
         discriminator_lr=2e-4,
         discriminator_decay=1e-6,
-        batch_size=500,
+        batch_size=200,
         discriminator_steps=1,
         log_frequency=True,
-        verbose=False,
-        epochs=300,
+        verbose=True,
+        epochs=10,
         pac=10,
         cuda=True,
     ):
@@ -288,7 +303,30 @@ class CTGAN(BaseSynthesizer):
 
         if invalid_columns:
             raise ValueError(f'Invalid columns found: {invalid_columns}')
+    #def getDiscriminator(self, subpac):
+        #data_dim = self._transformer.output_dimensions
+        #print("data_dim shape: ", data_dim)
+        #print("data_discri shape: ", (data_dim + self._data_sampler.dim_cond_vec()))
+        #return Discriminator(
+      #      data_dim + self._data_sampler.dim_cond_vec(), self._discriminator_dim, pac=subpac
+        #).to(self._device)
+    def getDiscriminator(self, sample_data, subpac):
+        # Chuyển đổi sample_data thành tensor nếu nó là numpy array
+        if isinstance(sample_data, np.ndarray):
+            sample_data = torch.tensor(sample_data)
 
+        # Xác định input_dim dựa trên kích thước của sample_data
+        input_dim = sample_data.shape[1] if sample_data.ndim > 1 else sample_data.size(0)
+        input_dim *= subpac  # Điều chỉnh input_dim theo pac nếu cần thiết
+
+        print("input_dim shape: ", input_dim)
+
+        # Khởi tạo và trả về Discriminator với input_dim đã điều chỉnh
+        return Discriminator(
+            input_dim=input_dim, discriminator_dim=self._discriminator_dim, pac=subpac
+        ).to(self._device)
+
+        
     @random_state
     def fit(self, train_data, discrete_columns=(), epochs=None):
         """Fit the CTGAN Synthesizer models to the training data.
@@ -457,6 +495,8 @@ class CTGAN(BaseSynthesizer):
                 epoch_iterator.set_description(
                     description.format(gen=generator_loss, dis=discriminator_loss)
                 )
+        file_name = f'ctgan_model_epoch_{self._epochs}.pth'
+        self.save_model(output_dir="2018",file_name = file_name)
 
     @random_state
     def sample(self, n, condition_column=None, condition_value=None):
@@ -515,8 +555,122 @@ class CTGAN(BaseSynthesizer):
 
         return self._transformer.inverse_transform(data)
 
+    @random_state
+    def sample_by_label(self, n, label_column, label_value):
+        """
+        Sample data from a specific label in the dataset.
+
+        Args:
+            n (int): Number of rows to sample.
+            label_column (string): Name of the column representing the labels.
+            label_value (string or int): Specific label value to condition the sampling on.
+
+        Returns:
+            pandas.DataFrame: Sampled data matching the specified label.
+        """
+        if not self._transformer:
+            raise ValueError("The model must be trained before sampling.")
+
+        # Lấy thông tin nhãn từ transformer
+        condition_info = self._transformer.convert_column_name_value_to_id(
+            label_column, label_value
+        )
+        global_condition_vec = self._data_sampler.generate_cond_from_condition_column_info(
+            condition_info, self._batch_size
+        )
+
+        steps = (n + self._batch_size - 1) // self._batch_size  # Đảm bảo đủ số lượng mẫu
+        data = []
+
+        total_samples = 0  # Theo dõi số lượng mẫu đã sinh
+
+        for _ in range(steps):
+            # Sinh noise
+            mean = torch.zeros(self._batch_size, self._embedding_dim, device=self._device)
+            std = mean + 1
+            fakez = torch.normal(mean=mean, std=std)
+
+            # Áp dụng điều kiện nhãn
+            condvec = global_condition_vec.copy()
+            condvec = torch.from_numpy(condvec).to(self._device)
+            fakez = torch.cat([fakez, condvec], dim=1)
+
+            # Sinh dữ liệu
+            with torch.no_grad():
+                fake = self._generator(fakez)
+                fakeact = self._apply_activate(fake)
+                sampled_data = fakeact.detach().cpu().numpy()
+
+            data.append(sampled_data)
+            total_samples += len(sampled_data)
+
+            # Dừng nếu đủ số lượng mẫu
+            if total_samples >= n:
+                break
+
+        # Gộp dữ liệu và lấy đúng số lượng mẫu
+        data = np.concatenate(data, axis=0)[:n]
+
+        # Chuyển dữ liệu về định dạng ban đầu
+        return self._transformer.inverse_transform(data)
+
+
     def set_device(self, device):
         """Set the `device` to be used ('GPU' or 'CPU)."""
         self._device = device
         if self._generator is not None:
             self._generator.to(self._device)
+
+    def save_model(self, output_dir="output", file_name = "model_saved"):
+        """Lưu mô hình CTGAN vào tệp .pth sau khi huấn luyện."""
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+            
+        model_path = os.path.join(output_dir, file_name)
+        torch.save({
+            'generator_state_dict': self._generator.state_dict(),
+            'transformer': self._transformer,
+            'data_sampler': self._data_sampler,
+            'config': {
+                'embedding_dim': self._embedding_dim,
+                'generator_dim': self._generator_dim,
+                'discriminator_dim': self._discriminator_dim,
+                'batch_size': self._batch_size,
+                'pac': self.pac,
+                'device': str(self._device)
+            }
+        }, model_path)
+        print(f"Model saved to {model_path}")
+
+    def load_model(self, model_path, device='cuda'):
+        """Tải mô hình CTGAN từ tệp .pth."""
+        checkpoint = torch.load(model_path, map_location=device)
+        
+        # Khôi phục cấu hình từ checkpoint
+        self._embedding_dim = checkpoint['config']['embedding_dim']
+        self._generator_dim = checkpoint['config']['generator_dim']
+        self._discriminator_dim = checkpoint['config']['discriminator_dim']
+        self._batch_size = checkpoint['config']['batch_size']
+        self.pac = checkpoint['config']['pac']
+        self._device = torch.device(device if torch.cuda.is_available() else 'cpu')
+        
+        # Khởi tạo các thành phần mô hình
+        data_dim = checkpoint['transformer'].output_dimensions
+        self._transformer = checkpoint['transformer']
+        self._data_sampler = checkpoint['data_sampler']
+        
+        # Khởi tạo generator và discriminator với cấu hình đã lưu
+        self._generator = Generator(
+            self._embedding_dim + self._data_sampler.dim_cond_vec(), 
+            self._generator_dim, 
+            data_dim
+        ).to(self._device)
+        self._generator.load_state_dict(checkpoint['generator_state_dict'])
+        
+        self._discriminator = Discriminator(
+            data_dim + self._data_sampler.dim_cond_vec(), 
+            self._discriminator_dim, 
+            pac=self.pac
+        ).to(self._device)
+        
+        print(f"Model loaded from {model_path}")
