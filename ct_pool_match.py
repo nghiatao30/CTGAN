@@ -262,20 +262,9 @@ def train_match_model(args, model, optim_model, trainloader, criterion):
         optim_model.step()  # Cập nhật mô hình
 
         
-def train(args, ctgan,modelfolder, modelfilesavepath, generator, discriminator, optim_g, optim_d, trainloader, label_mapping, criterion, aug=None):
+def train(args, ctgan, modelfolder, modelfilesavepath, generator, discriminator, optim_g, optim_d, trainloader, label_mapping, criterion, aug=None):
     """
-    Hàm huấn luyện với việc tối ưu hóa generator của CTGAN.
-
-    Args:
-        args: Tham số cấu hình.
-        ctgan (CTGAN): Mô hình CTGAN đã được huấn luyện.
-        discriminator: Mô hình Discriminator.
-        optim_d: Optimizer cho discriminator.
-        trainloader: DataLoader chứa các batch từ real_data.
-        label_mapping: Mapping giữa nhãn thực và mã hóa.
-        criterion: Loss function để tính toán class loss.
-        aug: Augmentation function (nếu có).
-        aug_rand: Random augmentation (nếu có).
+    Hàm huấn luyện với việc tối ưu hóa generator của CTGAN, sử dụng logic giống pool_match.
     """
     torch.autograd.set_detect_anomaly(True)
     gen_losses = AverageMeter()
@@ -293,41 +282,39 @@ def train(args, ctgan,modelfolder, modelfilesavepath, generator, discriminator, 
         for batch_idx, (real_data,) in enumerate(trainloader):
             real_data = real_data.cuda()
             real_data = torch.tensor(real_data, dtype=torch.float32)
-            img_real = real_data[:, :-1] 
-            real_labels = real_data[:, -1].long()  # Giả sử nhãn là cột cuối
-            unique_labels = torch.unique(real_labels)
+            img_real = real_data[:, :-1]
+            real_labels = real_data[:, -1].long()
+
             # --- Train Generator ---
             optim_g.zero_grad()
-            discriminator.eval()  # Ensure discriminator is in evaluation mode
+            discriminator.eval()
 
-            # Generate synthetic labels and data
-            
-
-            #label_counts = dict(pd.Series(gen_labels.cpu().numpy()).value_counts())
-            gen_data = ctgan.sample(len(real_data))  # Generate synthetic data
+            # Sinh dữ liệu tổng hợp từ CTGAN
+            gen_data = ctgan.sample(len(real_data))
             gen_data = preprocess_data(gen_data)
-            gen_data = torch.tensor(gen_data.values, dtype=torch.float32).cuda()  # Convert to tensor and move to GPU
-            gen_data = gen_data.cuda() 
-            img_syn = gen_data[:, :-1] 
-            gen_labels = gen_data[:, -1].long()
-            gen_source, gen_class = discriminator.predict(img_syn, args.num_classes) 
+            gen_data = torch.tensor(gen_data.values, dtype=torch.float32).cuda()
 
-            gen_source_loss = -torch.mean(gen_source)                                                                                                            
+            img_syn = gen_data[:, :-1]
+            gen_labels = gen_data[:, -1].long()
+            gen_source, gen_class = discriminator.predict(img_syn, args.num_classes)
+
+            gen_source_loss = -torch.mean(gen_source)
             gen_class_loss = criterion(gen_class, real_labels)
             gen_loss = gen_source_loss + gen_class_loss
 
+            # Huấn luyện mô hình matching
             train_match_model(args, model, optim_model, trainloader, criterion)
 
+            # Tính matching loss
             if args.match_aug:
                 img_aug = aug(torch.cat([img_real, img_syn]))
                 match_loss = matchloss(args, img_aug[:args.batch_size], img_aug[args.batch_size:], real_labels, real_labels, model)
             else:
                 match_loss = matchloss(args, img_real, img_syn, real_labels, real_labels, model)
-            
-            gen_loss = gen_loss + match_loss
 
+            gen_loss = gen_loss + match_loss
             gen_loss.backward()
-            optim_g.step()  # Optimize generator
+            optim_g.step()
             gen_losses.update(gen_loss.item(), img_real.size(0))
 
             # --- Train Discriminator ---
@@ -335,7 +322,13 @@ def train(args, ctgan,modelfolder, modelfilesavepath, generator, discriminator, 
             discriminator.train()
 
             with torch.no_grad():
-                fake_data = img_syn.clone()
+                # Sinh dữ liệu tổng hợp lần nữa để huấn luyện discriminator
+                gen_data_disc = ctgan.sample(len(real_data))
+                gen_data_disc = preprocess_data(gen_data_disc)
+                gen_data_disc = torch.tensor(gen_data_disc.values, dtype=torch.float32).cuda()
+
+                fake_data = gen_data_disc[:, :-1]
+                fake_labels = gen_data_disc[:, -1].long()
 
             fake_preds, fake_logits = discriminator.predict(fake_data, args.num_classes)
             real_preds, real_logits = discriminator.predict(img_real, args.num_classes)
@@ -347,13 +340,13 @@ def train(args, ctgan,modelfolder, modelfilesavepath, generator, discriminator, 
             real_source_loss = -torch.mean(real_preds)
 
             real_class_loss = criterion(real_logits, real_labels)
-            fake_class_loss = criterion(fake_logits, gen_labels)
+            fake_class_loss = criterion(fake_logits, fake_labels)
 
-            #gradient_penalty = calc_gradient_penalty(discriminator, real_data, fake_data)
-            disc_loss = real_source_loss + fake_source_loss + real_class_loss + fake_class_loss + calc_gradient_penalty(discriminator, img_real,fake_data)
+            gradient_penalty = calc_gradient_penalty(discriminator, img_real, fake_data)
+            disc_loss = real_source_loss + fake_source_loss + real_class_loss + fake_class_loss + gradient_penalty
 
             disc_loss.backward()
-            optim_d.step()  # Tối ưu hóa discriminator
+            optim_d.step()
             disc_losses.update(disc_loss.item(), real_data.size(0))
 
             # --- Logits Matching Loss ---
@@ -372,7 +365,8 @@ def train(args, ctgan,modelfolder, modelfilesavepath, generator, discriminator, 
         model_save_path_d = os.path.join(args.output_dir, f'discriminator_epoch_{epoch}.pth')
         torch.save(generator.state_dict(), model_save_path_g)
         torch.save(discriminator.state_dict(), model_save_path_d)
-    ctgan.save_model(output_dir=modelfolder, file_name = modelfilesavepath)
+
+    ctgan.save_model(output_dir=modelfolder, file_name=modelfilesavepath)
     print(f'Models saved at {model_save_path_g} and {model_save_path_d} for epoch {epoch}')
 
 
