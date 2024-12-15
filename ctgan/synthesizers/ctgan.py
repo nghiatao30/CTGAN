@@ -56,19 +56,29 @@ class Discriminator(Module):
 
         return gradient_penalty
 
-    def predict_with_logits(self, input_):
-        """Returns both preds and logits directly from the final layer in self.seq."""
-        # Kiểm tra nếu input_ là một TensorDataset, chuyển đổi sang Tensor
+    def predict(self, input_, num_classes):
+        """Returns gen_source and gen_class with correct size based on num_classes."""
         if isinstance(input_, TensorDataset):
-            # Lấy phần dữ liệu từ TensorDataset
             input_ = input_.tensors[0]
-        # Đảm bảo input_ là một tensor và có đúng định dạng
+
         if not isinstance(input_, torch.Tensor):
             input_ = torch.tensor(input_, dtype=torch.float32)
         input_ = input_.to(self.seq[0].weight.device)
-        logits = self.seq(input_)  # Sử dụng trực tiếp đầu ra từ self.seq
-        preds = torch.sigmoid(logits)  # Áp dụng hàm sigmoid để sinh ra xác suất
-        return preds, logits
+
+        logits = self.seq(input_)  # Truyền qua mạng để nhận logits
+        logits = logits.to(self.seq[0].weight.device)
+        if num_classes == 1:
+            # Binary classification (real/fake)
+            gen_source = torch.sigmoid(logits)  # Lấy giá trị đầu tiên cho real/fake
+            gen_class = torch.sigmoid(logits)  # gen_class có kích thước [batch_size, 2]
+        else:
+            # Multi-class classification
+            gen_source = Linear(logits.size(1), 1).to(self.seq[0].weight.device)(logits)  # Không có gen_source trong multi-class
+            # Tạo gen_class với kích thước [batch_size, num_classes]
+            gen_class = Linear(logits.size(1), num_classes).to(self.seq[0].weight.device)(logits)  # Lấy logits cho các lớp từ thứ hai trở đi
+
+        return gen_source, gen_class
+
     
     def forward(self, input_):
         """Apply the Discriminator to the `input_`."""
@@ -171,7 +181,7 @@ class CTGAN(BaseSynthesizer):
         discriminator_steps=1,
         log_frequency=True,
         verbose=True,
-        epochs=10,
+        epochs=20,
         pac=10,
         cuda=True,
     ):
@@ -205,6 +215,9 @@ class CTGAN(BaseSynthesizer):
         self._transformer = None
         self._data_sampler = None
         self._generator = None
+        self._discriminator = None
+        self.optim_G = None
+        self.optim_D = None
         self.loss_values = None
 
     @staticmethod
@@ -303,13 +316,15 @@ class CTGAN(BaseSynthesizer):
 
         if invalid_columns:
             raise ValueError(f'Invalid columns found: {invalid_columns}')
-    #def getDiscriminator(self, subpac):
-        #data_dim = self._transformer.output_dimensions
-        #print("data_dim shape: ", data_dim)
-        #print("data_discri shape: ", (data_dim + self._data_sampler.dim_cond_vec()))
-        #return Discriminator(
-      #      data_dim + self._data_sampler.dim_cond_vec(), self._discriminator_dim, pac=subpac
-        #).to(self._device)
+        
+    # def getDiscriminator(self, subpac):
+    #     data_dim = self._transformer.output_dimensions
+    #     print("data_dim shape: ", data_dim)
+    #     print("data_discri shape: ", (data_dim + self._data_sampler.dim_cond_vec()))
+    #     return Discriminator(
+    #        data_dim + self._data_sampler.dim_cond_vec(), self._discriminator_dim, pac=subpac
+    #     ).to(self._device)
+    
     def getDiscriminator(self, sample_data, subpac):
         # Chuyển đổi sample_data thành tensor nếu nó là numpy array
         if isinstance(sample_data, np.ndarray):
@@ -325,6 +340,25 @@ class CTGAN(BaseSynthesizer):
         return Discriminator(
             input_dim=input_dim, discriminator_dim=self._discriminator_dim, pac=subpac
         ).to(self._device)
+
+    # def getDiscriminator(self, sample_data, subpac):
+    #     # Chuyển đổi sample_data thành tensor nếu nó là numpy array
+    #     if isinstance(sample_data, np.ndarray):
+    #         sample_data = torch.tensor(sample_data)
+
+    #     # Xác định input_dim dựa trên kích thước của sample_data
+    #     input_dim = sample_data.shape[1] if sample_data.ndim > 1 else sample_data.size(0)
+    #     input_dim *= subpac  # Điều chỉnh input_dim theo pac nếu cần thiết
+
+    #     print("input_dim shape: ", input_dim)
+
+    #     # Gọi self._discriminator thay vì tạo mới
+    #     # Điều chỉnh lại input_dim và pac dựa trên tham số
+    #     self._discriminator.input_dim = input_dim  # Điều chỉnh lại input_dim cho _discriminator
+    #     self._discriminator.pac = subpac  # Điều chỉnh lại pac cho _discriminator
+
+    #     # Trả về discriminator đã được điều chỉnh
+    #     return self._discriminator.to(self._device)
 
         
     @random_state
@@ -364,23 +398,25 @@ class CTGAN(BaseSynthesizer):
 
         data_dim = self._transformer.output_dimensions
 
+        # Initialize generator and discriminator
         self._generator = Generator(
             self._embedding_dim + self._data_sampler.dim_cond_vec(), self._generator_dim, data_dim
         ).to(self._device)
 
-        discriminator = Discriminator(
+        self._discriminator = Discriminator(
             data_dim + self._data_sampler.dim_cond_vec(), self._discriminator_dim, pac=self.pac
         ).to(self._device)
 
-        optimizerG = optim.Adam(
+        # Initialize optimizers for generator and discriminator
+        self.optim_G = optim.Adam(
             self._generator.parameters(),
             lr=self._generator_lr,
             betas=(0.5, 0.9),
             weight_decay=self._generator_decay,
         )
 
-        optimizerD = optim.Adam(
-            discriminator.parameters(),
+        self.optim_D = optim.Adam(
+            self._discriminator.parameters(),
             lr=self._discriminator_lr,
             betas=(0.5, 0.9),
             weight_decay=self._discriminator_decay,
@@ -389,7 +425,7 @@ class CTGAN(BaseSynthesizer):
         mean = torch.zeros(self._batch_size, self._embedding_dim, device=self._device)
         std = mean + 1
 
-        self.loss_values = pd.DataFrame(columns=['Epoch', 'Generator Loss', 'Distriminator Loss'])
+        self.loss_values = pd.DataFrame(columns=['Epoch', 'Generator Loss', 'Discriminator Loss'])
 
         epoch_iterator = tqdm(range(epochs), disable=(not self._verbose))
         if self._verbose:
@@ -433,18 +469,18 @@ class CTGAN(BaseSynthesizer):
                         real_cat = real
                         fake_cat = fakeact
 
-                    y_fake = discriminator(fake_cat)
-                    y_real = discriminator(real_cat)
+                    y_fake = self._discriminator(fake_cat)
+                    y_real = self._discriminator(real_cat)
 
-                    pen = discriminator.calc_gradient_penalty(
+                    pen = self._discriminator.calc_gradient_penalty(
                         real_cat, fake_cat, self._device, self.pac
                     )
                     loss_d = -(torch.mean(y_real) - torch.mean(y_fake))
 
-                    optimizerD.zero_grad(set_to_none=False)
+                    self.optim_D.zero_grad(set_to_none=False)
                     pen.backward(retain_graph=True)
                     loss_d.backward()
-                    optimizerD.step()
+                    self.optim_D.step()
 
                 fakez = torch.normal(mean=mean, std=std)
                 condvec = self._data_sampler.sample_condvec(self._batch_size)
@@ -461,20 +497,20 @@ class CTGAN(BaseSynthesizer):
                 fakeact = self._apply_activate(fake)
 
                 if c1 is not None:
-                    y_fake = discriminator(torch.cat([fakeact, c1], dim=1))
+                    y_fake = self._discriminator(torch.cat([fakeact, c1], dim=1))
                 else:
-                    y_fake = discriminator(fakeact)
+                    y_fake = self._discriminator(fakeact)
 
                 if condvec is None:
-                    cross_entropy = 0
+                    cross_entropy = 6
                 else:
                     cross_entropy = self._cond_loss(fake, c1, m1)
 
                 loss_g = -torch.mean(y_fake) + cross_entropy
 
-                optimizerG.zero_grad(set_to_none=False)
+                self.optim_G.zero_grad(set_to_none=False)
                 loss_g.backward()
-                optimizerG.step()
+                self.optim_G.step()
 
             generator_loss = loss_g.detach().cpu().item()
             discriminator_loss = loss_d.detach().cpu().item()
@@ -496,7 +532,8 @@ class CTGAN(BaseSynthesizer):
                     description.format(gen=generator_loss, dis=discriminator_loss)
                 )
         file_name = f'ctgan_model_epoch_{self._epochs}.pth'
-        self.save_model(output_dir="2018",file_name = file_name)
+        self.save_model(output_dir="2018", file_name=file_name)
+
 
     @random_state
     def sample(self, n, condition_column=None, condition_value=None):
@@ -629,15 +666,18 @@ class CTGAN(BaseSynthesizer):
         model_path = os.path.join(output_dir, file_name)
         torch.save({
             'generator_state_dict': self._generator.state_dict(),
+            'discriminator_state_dict': self._discriminator.state_dict(),  # Lưu trạng thái của discriminator
+            'optim_g_state_dict': self.optim_G.state_dict(),  # Lưu trạng thái của optimizer generator
+            'optim_d_state_dict': self.optim_D.state_dict(),  # Lưu trạng thái của optimizer discriminator
             'transformer': self._transformer,
             'data_sampler': self._data_sampler,
             'config': {
-                'embedding_dim': self._embedding_dim,
-                'generator_dim': self._generator_dim,
-                'discriminator_dim': self._discriminator_dim,
-                'batch_size': self._batch_size,
-                'pac': self.pac,
-                'device': str(self._device)
+            'embedding_dim': self._embedding_dim,
+            'generator_dim': self._generator_dim,
+            'discriminator_dim': self._discriminator_dim,
+            'batch_size': self._batch_size,
+            'pac': self.pac,
+            'device': str(self._device)
             }
         }, model_path)
         print(f"Model saved to {model_path}")
@@ -674,3 +714,24 @@ class CTGAN(BaseSynthesizer):
         ).to(self._device)
         
         print(f"Model loaded from {model_path}")
+
+def sample_by_percentage(original_data, label_column, percentage, generator, label_column_name):
+
+    grouped = original_data.groupby(label_column)
+    sampled_data = []
+    
+    for label, group in grouped:
+        # Determine the number of samples to generate
+        sample_size = int(len(group) * percentage / 100)
+        if sample_size > 0:
+            # Generate synthetic samples using the CTGAN model
+            synthetic_samples = generator.sample_by_label(
+                n=sample_size,
+                label_column=label_column_name,
+                label_value=label
+            )
+            sampled_data.append(synthetic_samples)
+
+    # Concatenate the sampled data and return as a single DataFrame
+    sampled_data = pd.concat(sampled_data, ignore_index=True)
+    return sampled_data

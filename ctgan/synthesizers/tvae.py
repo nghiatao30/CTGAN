@@ -112,10 +112,10 @@ class TVAE(BaseSynthesizer):
         decompress_dims=(128, 128),
         l2scale=1e-5,
         batch_size=500,
-        epochs=300,
+        epochs=10,
         loss_factor=2,
         cuda=True,
-        verbose=False,
+        verbose=True,
     ):
         self.embedding_dim = embedding_dim
         self.compress_dims = compress_dims
